@@ -25,95 +25,124 @@ This project explores the feasibility of using advanced machine learning models 
 ## Quick Start
 
 ```bash
-pip install webgenai
+# Install from source
+git clone https://github.com/Lumi-node/webgenai.git
+cd webgenai
+pip install .
+
+# Or install with dev dependencies
+pip install ".[dev]"
 ```
+
+### Generate a synthetic dataset and train a model
 
 ```python
-from ane_design_model.model import Model
-from ane_design_model.inference import generate_component
+from ane_design_model.dataset_generator import DatasetGenerator
+from ane_design_model.model_trainer import ModelTrainer
 
-# Initialize the model (assuming pre-trained weights are available)
-model = Model()
+# 1. Generate synthetic design mockups with ground-truth labels
+generator = DatasetGenerator(seed=42)
+labels = generator.generate_dataset(count=50, output_dir="./dataset")
 
-# Generate a component based on a conceptual input structure
-component_code = generate_component(input_data={"layout": "grid", "style": "modern"})
-print(component_code)
+# 2. Train the CNN+MLP classifier on the generated dataset
+trainer = ModelTrainer(batch_size=16, epochs=10, learning_rate=0.001)
+metrics = trainer.train(dataset_dir="./dataset", output_path="./model.pt")
+print(f"Val accuracy: {metrics['val_accuracy']:.2%}")
 ```
 
-## What Can You Do?
-
-### Model Training and Benchmarking
-Use the provided utilities to train and evaluate the underlying design model against synthetic datasets.
+### Run inference on a design image
 
 ```python
-from ane_design_model.model_trainer import train_model
-from ane_design_model.benchmark import run_benchmark
+import numpy as np
+from ane_design_model.inference import ComponentClassifierInference
 
-# Train the model using a custom dataset generator
-train_model(dataset_path="./synthetic_data")
+# Load a trained model checkpoint
+engine = ComponentClassifierInference(model_path="./model.pt")
 
-# Run performance benchmarks
-results = run_benchmark(model_instance)
-print(results)
+# Classify a full design image into layout regions
+image = np.random.randint(0, 255, (600, 800, 3), dtype=np.uint8)  # or load a real PNG
+layout = engine.predict_image_layout(image)
+# Returns: {"header": {"x":..., "y":..., "width":..., "height":...}, "sidebar": ..., "content": ..., "footer": ...}
+
+# Classify a single 128x128 patch
+patch = np.random.randint(0, 255, (128, 128, 3), dtype=np.uint8)
+class_id = engine.predict_patch_class(patch)  # 0=header, 1=nav, 2=card, 3=footer
 ```
 
-### Component Inference
-Leverage the inference module to generate optimized web component code from abstract inputs.
+### CLI tools
 
-```python
-from ane_design_model.inference import generate_component
-
-# Generate a component based on a specific prompt or configuration
-output = generate_component(prompt="A responsive navigation bar")
-print(output)
+```bash
+# Generate a synthetic dataset
+python -m ane_design_model.dataset_generator --count 50 --output ./dataset --seed 42
 ```
+
+> **Note:** The `benchmark` and `ml_layout_detector` modules depend on an external
+> `layout_detector` heuristic module bundled under `sources/`. These are functional
+> but intended as internal comparison tools rather than public API.
 
 ## Architecture
 
-The architecture is centered around the `ane_design_model` package, which manages the entire lifecycle from data preparation to final code generation.
+The package is a patch-based CNN+MLP classifier that divides design mockup images into 128x128 pixel patches and classifies each patch as one of four layout regions: **header**, **nav** (sidebar), **card** (content), or **footer**. Region boundaries are reconstructed by computing bounding boxes over the classified patch grid.
 
-The flow generally moves from **Dataset Generation** $\rightarrow$ **Model Training** $\rightarrow$ **Inference**. The `ml_layout_detector` assists in parsing structural information, which feeds into the core `model.py`. The `model_trainer.py` handles optimization, while `inference.py` utilizes the trained `model.py` to produce the final output.
+The pipeline flows from **Dataset Generation** (synthetic mockups with brightness-based ground truth) to **Model Training** (supervised CNN+MLP on patch labels) to **Inference** (patch classification and layout reconstruction).
 
 ```mermaid
 graph TD
-    A[DatasetGenerator] --> B(ModelTrainer);
-    B --> C{Model};
-    D[MLLayoutDetector] --> C;
-    C --> E[Inference];
-    E --> F[Web Component Output];
+    A[DatasetGenerator] -->|synthetic images + labels.json| B(ModelTrainer);
+    B -->|model.pt checkpoint| C[ComponentClassifierInference];
+    C -->|predict_image_layout| D[Layout Region Dict];
+    C -->|predict_patch_class| E[Single Patch Class ID];
 ```
 
 ## API Reference
 
-### `ane_design_model.model.Model`
-The core neural network wrapper.
-- `__init__()`: Initializes the model structure.
-- `load_weights(path)`: Loads pre-trained weights.
+### `ane_design_model.model.ComponentClassifier`
+CNN+MLP neural network for patch-based component classification (PyTorch `nn.Module`).
+- **Input:** `(batch, 3, 128, 128)` float32 tensor in [0, 1]
+- **Output:** `(batch, 4)` float32 logits (header, nav, card, footer)
 
-### `ane_design_model.inference.generate_component(input_data)`
-Generates the final web component code.
-- **Parameters**: `input_data` (dict) - Configuration for the component.
-- **Returns**: `str` - The generated HTML/CSS/JS code.
+### `ane_design_model.model.create_model() -> ComponentClassifier`
+Factory function that returns a new `ComponentClassifier` instance.
 
-### `ane_design_model.model_trainer.train_model(dataset_path)`
-Initiates the training loop.
-- **Parameters**: `dataset_path` (str) - Path to the training data.
+### `ane_design_model.inference.ComponentClassifierInference`
+Inference engine that loads a trained checkpoint and performs classification.
+- `__init__(model_path: str, device: str | None = None)` -- loads checkpoint, auto-detects device
+- `predict_patch_class(patch: np.ndarray) -> int` -- classifies a single `(128, 128, 3)` uint8 patch, returns class ID (0-3)
+- `predict_batch(patches: torch.Tensor) -> torch.Tensor` -- classifies a batch `(N, 3, 128, 128)` float32 tensor, returns `(N, 4)` logits
+- `predict_image_layout(image: np.ndarray) -> dict` -- classifies a full `(H, W, 3)` uint8 image, returns `{"header": ..., "sidebar": ..., "content": ..., "footer": ...}`
+
+### `ane_design_model.dataset_generator.DatasetGenerator`
+Generates synthetic design mockups with ground-truth component labels.
+- `__init__(seed: int = 42)`
+- `generate_synthetic_image(index: int) -> np.ndarray` -- returns a `(300, 400, 3)` uint8 RGB image
+- `generate_dataset(count: int, output_dir: str) -> LabelsDict` -- saves PNG images and `labels.json`
+
+### `ane_design_model.model_trainer.ModelTrainer`
+Trains the `ComponentClassifier` on a synthetic dataset.
+- `__init__(batch_size=16, epochs=10, learning_rate=0.001, device=None)`
+- `train(dataset_dir: str, output_path: str, verbose: bool = True) -> dict` -- trains and saves checkpoint; returns `{"train_loss": float, "val_accuracy": float, "epochs_trained": int}`
+
+### `ane_design_model` (package constants and utilities)
+- `COMPONENT_CLASSES` -- `{"header": 0, "nav": 1, "card": 2, "footer": 3}`
+- `get_component_class(region_name: str) -> int` -- maps region name (with aliases like "sidebar", "content") to class ID
+- `get_region_name(class_id: int) -> str` -- maps class ID back to canonical name
 
 ## Research Background
 
-This project is inspired by the growing field of Neural Code Generation and Design-to-Code synthesis. It draws conceptual parallels from research in visual reasoning and automated UI generation, aiming to provide a practical, albeit early-stage, implementation of these concepts.
+This project explores neural layout detection as an alternative to brightness-heuristic approaches for design-to-code conversion. The CNN+MLP architecture operates on fixed 128x128 patches, trading global context for simplicity and speed. On Apple Silicon, the inference path optionally accelerates via the Apple Neural Engine (ANE) when available.
 
 ## Testing
 
-The project includes 8 test files covering unit and integration tests for the model training pipeline, ensuring the core components function as expected.
+The project includes 10 test files covering unit tests, integration tests, and cross-module integration for the full pipeline (dataset generation, model training, inference, ML layout detection, and benchmarking). Run with:
+
+```bash
+pytest tests/
+```
 
 ## Contributing
 
-Contributions are welcome! Please review the contribution guidelines for submitting pull requests or reporting issues.
-
-## Citation
-
-(No specific citations provided for this proof-of-concept.)
+Contributions are welcome! Please review the [contribution guidelines](CONTRIBUTING.md) for submitting pull requests or reporting issues.
 
 ## License
-The project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+MIT License -- see [LICENSE](LICENSE) for details.
